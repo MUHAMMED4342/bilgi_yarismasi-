@@ -1,0 +1,7 @@
+__pycache__/
+.venv32/
+build/
+dist/
+veri/
+*.spec
+*.zip
