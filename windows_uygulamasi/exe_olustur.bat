@@ -10,7 +10,7 @@ rem 32 bit Python otomatik bulunamazsa buraya tam yolunu yazabilirsin. Ornek: C:
 set "PY32="
 rem ====================
 
-for %%F in (bilgi_yarismasi.py online.py online_ui.py) do (
+for %%F in (bilgi_yarismasi.py eglence.py yasak.py yasal.py online.py online_ui.py) do (
   if not exist "%%F" (
     echo [HATA] %%F bulunamadi. Tum .py dosyalari bu bat dosyasiyla ayni klasorde olmali.
     pause & exit /b 1

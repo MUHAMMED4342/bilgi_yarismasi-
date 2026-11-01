@@ -489,10 +489,13 @@ class Session:
       msg(data)    | left()
     """
 
-    def __init__(self, transport_factory, emit, name):
+    def __init__(self, transport_factory, emit, name, pid="", banned=None):
         self.tf = transport_factory
         self.emit = emit
         self.name = (name or "Oyuncu")[:20]
+        self.pid = pid or ""            # kalıcı oyuncu kimliği (yasak denetimi için)
+        self.banned = banned if banned is not None else {}
+        self.opp_pid = ""
         self.id = uuid.uuid4().hex[:10]
         self.lock = threading.RLock()
         self.tr = None
@@ -644,7 +647,7 @@ class Session:
     def _start_joining(self, host_id, wait):
         self.state = "joining"
         self.hello_deadline = time.monotonic() + wait
-        self._pub(self.channel, {"t": "join", "name": self.name, "to": host_id})
+        self._pub(self.channel, {"t": "join", "name": self.name, "pid": self.pid, "to": host_id})
 
     def _pub(self, topic, d, retain=False):
         d = dict(d)
@@ -680,11 +683,20 @@ class Session:
         if not isinstance(d.get("ch"), str) or not isinstance(d.get("id"), str) \
                 or not d["ch"].startswith(CH):
             return
+        if self._is_banned(d.get("pid")):
+            return
         if self.state == "seeking":
             self.offer = d
         elif self.state == "hosting" and self.random and d["id"] < self.id:
             # İki kişi aynı anda bekleyici olduysa kimliği büyük olan diğerine katılır.
             self._switch_to(d)
+
+    def _is_banned(self, pid):
+        return isinstance(pid, str) and bool(pid) and pid in self.banned
+
+    @staticmethod
+    def _clean_pid(pid):
+        return pid if isinstance(pid, str) and len(pid) == 16 and all(c in "0123456789abcdef" for c in pid) else ""
 
     def _switch_to(self, offer):
         old = self.channel
@@ -707,7 +719,7 @@ class Session:
 
     def _publish_offer(self):
         self.next_offer = time.monotonic() + OFFER_REFRESH
-        self._pub(LOBBY, {"t": "wait", "id": self.id, "ch": self.channel, "name": self.name}, retain=True)
+        self._pub(LOBBY, {"t": "wait", "id": self.id, "ch": self.channel, "name": self.name, "pid": self.pid}, retain=True)
 
     def _on_channel(self, d):
         sender = d.get("from")
@@ -722,9 +734,14 @@ class Session:
             del seen[:-300]
         t = d.get("t")
         if self.state == "hosting" and t == "join":
-            self._accept_guest(sender, d)
+            if not self._is_banned(d.get("pid")):
+                self._accept_guest(sender, d)
         elif self.state == "joining" and t == "hello" and d.get("to") == self.id:
-            self._accept_host(sender, d)
+            if self._is_banned(d.get("pid")):
+                self.state = "closed"
+                self.emit("error", text="Bu oyuncu yasaklı olduğu için eşleşme iptal edildi.")
+            else:
+                self._accept_host(sender, d)
         elif self.state == "joining" and t == "full" and d.get("to") == self.id:
             self.state = "closed"
             self.emit("error", text="Oda dolu.")
@@ -738,7 +755,7 @@ class Session:
                 elif t == "ping":
                     pass
                 elif t == "join":  # hello kaybolduysa yeniden gönder
-                    self._pub(self.channel, {"t": "hello", "to": sender, "name": self.name})
+                    self._pub(self.channel, {"t": "hello", "to": sender, "name": self.name, "pid": self.pid})
                 elif d.get("to") in (None, self.id):
                     self.emit("msg", data=d)
 
@@ -748,7 +765,8 @@ class Session:
             return
         self.opp = sender
         self.opp_name = str(d.get("name") or "Rakip")[:20]
-        self._pub(self.channel, {"t": "hello", "to": sender, "name": self.name})
+        self.opp_pid = self._clean_pid(d.get("pid"))
+        self._pub(self.channel, {"t": "hello", "to": sender, "name": self.name, "pid": self.pid})
         if self.random:
             self.tr.publish(LOBBY, b"", retain=True)
             self.tr.unsubscribe(LOBBY)
@@ -757,6 +775,7 @@ class Session:
     def _accept_host(self, sender, d):
         self.opp = sender
         self.opp_name = str(d.get("name") or "Rakip")[:20]
+        self.opp_pid = self._clean_pid(d.get("pid"))
         if self.join_from_lobby:
             self.tr.unsubscribe(LOBBY)
         self._matched("guest")
@@ -767,7 +786,7 @@ class Session:
         self.last_seen = time.monotonic()
         self.next_ping = self.last_seen + PING_EVERY
         self.tr.subscribe(PREFIX + "/presence/" + self.opp)
-        self.emit("matched", role=role, opp_name=self.opp_name)
+        self.emit("matched", role=role, opp_name=self.opp_name, opp_pid=self.opp_pid)
 
     def _opp_left(self):
         if self.left_sent:

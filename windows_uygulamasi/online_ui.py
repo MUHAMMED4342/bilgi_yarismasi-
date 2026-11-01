@@ -2,10 +2,15 @@
 """Online düello ekranları (MainFrame'e karışım olarak eklenir)."""
 import random
 import time
+import webbrowser
 
 import wx
 
 import online as ol
+import yasak
+import yasal
+
+CONTACT_URL = yasal.SITE_URL + "/iletisim.html"
 
 LETTERS = "ABCD"
 ONLINE_SCREENS = ("ovs", "ogame", "osetup", "owait", "oresult", "odisc")
@@ -23,6 +28,8 @@ class OnlineMixin:
         self.duel = None
         self.my_name = str(self.cfg.d.get("ad", "") or "")
         self.opp_name = "Rakip"
+        self.opp_pid = ""
+        self.guarding = False
         self.is_host = False
         self.chat = []
         self.post_game = False
@@ -58,12 +65,33 @@ class OnlineMixin:
             s.close()
 
     # ------------------------------------------------------------ ad ve menü
+    def show_terms_gate(self):
+        self.screen = "tgate"
+        self.new_screen("Online - kullanım şartları")
+        self.add_heading("Kullanım Şartları")
+        self.add_text("Online oynamak için Kullanım Şartları'nı ve Gizlilik Politikası'nı kabul etmelisin.", 14)
+        tc = self.add_readonly("Kullanım Şartları", yasal.TERMS_TEXT, height=300, size=14)
+        self.add_button("Kabul ediyorum", lambda e: self.go(self.terms_accept), primary=True)
+        self.add_button("Gizlilik Politikası'nı oku", lambda e: self.go(self.show_legal, "privacy", self.show_terms_gate))
+        self.add_button("Kabul etmiyorum (ana menü)", lambda e: self.go(self.show_home))
+        self.finish_layout()
+        tc.SetFocus()
+        self.say("Online oynamadan önce Kullanım Şartları'nı oku. Kabul ediyorsan Kabul ediyorum düğmesine bas.")
+
+    def terms_accept(self):
+        self.cfg.d["sartlar"] = yasal.TERMS_VERSION
+        self.cfg.save()
+        self.show_online_name()
+
     def show_online_name(self, error=""):
         self.online_close()
+        if self.cfg.d.get("sartlar") != yasal.TERMS_VERSION:
+            self.show_terms_gate()
+            return
         self.screen = "oname"
         self.new_screen("Online - kullanıcı adı")
         self.add_heading("Online Oyna")
-        self.add_text("Rakibin seni bu adla görecek.", 14)
+        self.add_text("Rakibin seni bu adla görecek. Oyuncu kimliğin: %s. İtiraz ve bildirimlerde bu kimlik kullanılır." % self.pid, 14)
         lab = wx.StaticText(self.panel, label="Kullanıcı adınız")
         lab.SetFont(self.font(12))
         self.col.Add(lab, 0, wx.TOP, 6)
@@ -90,7 +118,77 @@ class OnlineMixin:
         self.my_name = v[:20]
         self.cfg.d["ad"] = self.my_name
         self.cfg.save()
-        self.go(self.show_online_menu)
+        self.go(self.online_guard, self.show_online_menu)
+
+    # ------------------------------------------------------------ yasak denetimi
+    def online_guard(self, fn, *args):
+        """Yasak listesini sorar; yasaklı değilsek (ya da sunucuya ulaşılamazsa) fn çalışır."""
+        if self.guarding:
+            return
+        self.guarding = True
+        self.say("Kontrol ediliyor…", interrupt=False)
+
+        def done(res, err):
+            self.guarding = False
+            ok, bans = res if res else (False, {})
+            if ok:
+                self.ban_map = bans
+            if self.pid in self.ban_map:
+                self.show_banned(self.ban_map[self.pid])
+            else:
+                fn(*args)
+        self.run_bg(yasak.fetch_bans, done)
+
+    def show_banned(self, until):
+        self.online_close()
+        self.screen = "obanned"
+        self.new_screen("Online erişim kapalı")
+        self.add_heading("Online erişimin kapalı")
+        if until:
+            when = time.strftime("%d.%m.%Y %H:%M", time.localtime(until / 1000.0)) + " tarihine kadar"
+        else:
+            when = "süresiz olarak"
+        text = ("Bu cihazın online oynaması %s kapatıldı. Tek başına, günlük meydan okuma ve çok oyunculu "
+                "modlar kullanılabilir. Yanlış olduğunu düşünüyorsan oyuncu kimliğinle itiraz edebilirsin.\n"
+                "Oyuncu kimliğin: %s" % (when, self.pid))
+        tc = self.add_readonly("Bilgi", text, height=160, size=16)
+        self.add_button("İtiraz / iletişim (tarayıcıda açılır)", lambda e: webbrowser.open(CONTACT_URL))
+        self.add_button("Ana menü", lambda e: self.go(self.show_home), primary=True)
+        self.finish_layout()
+        tc.SetFocus()
+        self.say("Online erişimin kapalı. " + text.replace("\n", " "))
+
+    # ------------------------------------------------------------ rakibi bildir
+    def report_opponent(self):
+        if not (self.opp_pid or self.opp_name != "Rakip"):
+            self.say("Bildirilecek bir rakip yok.")
+            return
+        labels = [k[1] for k in yasak.KINDS]
+        dlg = wx.SingleChoiceDialog(self, "%s adlı rakibi neden bildiriyorsun?" % self.opp_name,
+                                    "Rakibi bildir", labels)
+        self.say("Rakibi bildir. Nedeni seç ve Enter'a bas.")
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        kind = yasak.KINDS[dlg.GetSelection()][0]
+        dlg.Destroy()
+        d2 = wx.TextEntryDialog(self, "Açıklama (isteğe bağlı, en çok 300 karakter):", "Rakibi bildir")
+        try:
+            d2.SetMaxLength(300)
+        except Exception:
+            pass
+        ok = d2.ShowModal() == wx.ID_OK
+        note = d2.GetValue().strip()
+        d2.Destroy()
+        if not ok:
+            return
+        self.say("Bildirim gönderiliyor…", interrupt=False)
+        pid, name = self.opp_pid, self.opp_name
+
+        def done(res, err):
+            good, msg = res if res else (False, "Bağlantı kurulamadı.")
+            self.say("Bildirimin yöneticiye iletildi. Teşekkürler." if good else "Bildirim gönderilemedi: %s" % msg)
+        self.run_bg(lambda: yasak.send_report(self.pid, pid, name, kind, note), done)
 
     def show_online_menu(self, error=""):
         self.online_close()
@@ -100,8 +198,8 @@ class OnlineMixin:
         self.add_text("%s olarak oynuyorsun. 10 soru, hızlı ve doğru bilen daha çok puan alır." % self.my_name, 14)
         self.add_text("Sitedeki oyuncularla ve masaüstü uygulamasını kullananlarla eşleşebilirsin.", 12)
         self.add_text(error, 13)
-        first = self.add_button("Rastgele rakip bul", lambda e: self.go(self.start_random), primary=True)
-        self.add_button("Özel oda kur (arkadaşına kod ver)", lambda e: self.go(self.start_host))
+        first = self.add_button("Rastgele rakip bul", lambda e: self.go(self.online_guard, self.start_random), primary=True)
+        self.add_button("Özel oda kur (arkadaşına kod ver)", lambda e: self.go(self.online_guard, self.start_host))
         self.add_button("Kodla odaya katıl", lambda e: self.go(self.show_join_code))
         self.add_button("Adı değiştir", lambda e: self.go(self.show_online_name))
         self.add_button("Geri", lambda e: self.go(self.show_home))
@@ -136,7 +234,7 @@ class OnlineMixin:
             self.say("Kod 6 rakamdan oluşmalı.")
             self.o_code_tc.SetFocus()
             return
-        self.go(self.start_join, code)
+        self.go(self.online_guard, self.start_join, code)
 
     # ------------------------------------------------------------ bağlantı başlatma
     def _new_session(self):
@@ -146,11 +244,12 @@ class OnlineMixin:
         def emit(ev, **kw):
             wx.CallAfter(self.on_sess_event, holder.get("s"), ev, kw)
 
-        s = ol.Session(lambda on_msg: ol.MqttTransport(on_msg), emit, self.my_name)
+        s = ol.Session(lambda on_msg: ol.MqttTransport(on_msg), emit, self.my_name, self.pid, self.ban_map)
         holder["s"] = s
         self.sess = s
         self.chat = []
         self.opp_name = "Rakip"
+        self.opp_pid = ""
         self.my_rematch = self.opp_rematch = False
         return s
 
@@ -217,6 +316,7 @@ class OnlineMixin:
             self.show_online_menu(error=kw["text"])
         elif ev == "matched":
             self.opp_name = kw["opp_name"]
+            self.opp_pid = kw.get("opp_pid", "")
             self.is_host = kw["role"] == "host"
             self.sounds.play("bulundu")
             self.say("Rakip bulundu: %s." % self.opp_name)
@@ -673,6 +773,7 @@ class OnlineMixin:
                                          height=60, size=14)
         self.o_rm_btn = self.add_button("Rövanş", lambda e: self.go(self.request_rematch), primary=True)
         self.add_button("Yeni rakip", lambda e: self.go(self.show_online_menu))
+        self.add_button("Rakibi bildir (B)", lambda e: self.report_opponent())
         self.add_button("Ana menü", lambda e: self.go(self.show_home))
         self.finish_layout()
         if me > opp:
@@ -796,6 +897,9 @@ class OnlineMixin:
             if ch == "P":
                 self.say(self.players_text() + ".")
                 return True
+        if self.screen in ONLINE_SCREENS and ch == "B":
+            self.report_opponent()
+            return True
         if self.screen in ONLINE_SCREENS and self.in_match:
             if ch == "S":
                 self.chat_send()
